@@ -5707,9 +5707,22 @@ window.addEventListener('keydown', e=>{
   }
 });
 
+/* When the user is on the cover and presses "Begin the Journey",
+   play the cover narration first and only navigate to slide 2 once
+   that audio ends. This flag is read by speakSlide()'s onEnd hook. */
+let _navigateAfterCoverEnds = false;
+
 document.getElementById('startBtn').addEventListener('click', ()=>{
-  // skip to slide 2 — narration auto-starts on every page
-  goTo(1);
+  // Past the cover or muted? Just navigate, no narration to wait for.
+  if(currentIndex !== 0 || voMuted){ goTo(1); return; }
+  _navigateAfterCoverEnds = true;
+  // This click is a confirmed user gesture, so autoplay is now allowed.
+  // If the kick handler already started Voice 1 (it fires in capture
+  // phase, before this handler), don't restart — just let it play out.
+  if(!LOCAL_AUDIO.isSpeaking()){
+    setVoUi('playing');
+    speakSlide(0);
+  }
 });
 
 const backTopBtn = document.getElementById('backTop');
@@ -6509,106 +6522,127 @@ function clearTitleHl(){
 
 /* ===============================================================
    LOCAL MP3 NARRATION  (preferred over API when files exist)
-   - Drop files in:  assets/voice-01.mp3, voice-02.mp3, ... voice-30.mp3
+   - Files live in:  assets/Voice 1.mp3 ... assets/Voice 30.mp3
    - Each plays automatically when its slide is shown.
-   - No API key needed. Survives even if ElevenLabs is offline.
+   - No API key needed.
+
+   Performance notes:
+   - Audio elements are CACHED per slide (created once, reused),
+     so a slide that has been visited once will replay instantly.
+   - Neighbors (current + next two) are preloaded eagerly, so by
+     the time the user advances, the next file is already buffered.
+   - We do NOT pre-probe URLs — the filename pattern is fixed and
+     the old probe was the source of the 4-second per-slide delay.
    =============================================================== */
 const LOCAL_AUDIO = (function(){
-  const checked = {};   // slideIdx → boolean (file exists?)
-  const elements = {};  // slideIdx → HTMLAudioElement
-  let currentEl = null;
+  const TOTAL = 30;
+  const elements = {};  // slideIdx → HTMLAudioElement (cached for reuse)
+  const failed   = {};  // slideIdx → true if MP3 errored (don't retry)
+  let currentEl  = null;
+  let currentHandlers = null;
 
-  // Filename patterns the deck will try, in order. The first one that
-  // an HTML <audio> element can actually load wins.
-  // We probe with Audio (not fetch HEAD) so this works on file://,
-  // http://, and https:// identically — fetch HEAD often fails or
-  // returns opaque responses on file:// in many browsers.
-  function pathCandidates(i){
-    const n1 = String(i+1);                  // "1"
-    const n2 = String(i+1).padStart(2,'0');  // "01"
-    return [
-      'assets/Voice%20' + n1 + '.mp3',       // "Voice 1.mp3"  ← user's ElevenLabs export
-      'assets/Voice ' + n1 + '.mp3',         // unencoded form, some servers accept this
-      'assets/Voice%20' + n2 + '.mp3',       // "Voice 01.mp3"
-      'assets/voice-' + n2 + '.mp3',         // "voice-01.mp3"
-      'assets/voice-' + n1 + '.mp3',         // "voice-1.mp3"
-      'assets/voice%20' + n1 + '.mp3',       // "voice 1.mp3"
-      'assets/voice_' + n2 + '.mp3',         // "voice_01.mp3"
-    ];
+  function urlFor(i){
+    // "Voice 1.mp3" → URL-encoded space (works on file:// and http(s)://).
+    return 'assets/Voice%20' + (i+1) + '.mp3';
   }
-  function pathFor(i){
-    // Returns whichever candidate has been resolved, or the first one.
-    return (typeof checked[i] === 'string') ? checked[i] : pathCandidates(i)[0];
-  }
-  // Probe a URL with a throwaway Audio element. Resolves true if the
-  // browser can actually start loading it (canplay/loadedmetadata) and
-  // false if it errors or times out.
-  function probeOne(url){
-    return new Promise(resolve => {
+
+  function getOrCreate(i){
+    if(failed[i]) return null;
+    if(!elements[i]){
       try{
-        const a = new Audio();
-        a.preload = 'metadata';
-        let done = false;
-        const ok  = ()=>{ if(done) return; done = true; cleanup(); resolve(true); };
-        const bad = ()=>{ if(done) return; done = true; cleanup(); resolve(false); };
-        function cleanup(){
-          a.removeEventListener('loadedmetadata', ok);
-          a.removeEventListener('canplay',        ok);
-          a.removeEventListener('canplaythrough', ok);
-          a.removeEventListener('error',          bad);
-        }
-        a.addEventListener('loadedmetadata', ok,  { once: true });
-        a.addEventListener('canplay',        ok,  { once: true });
-        a.addEventListener('canplaythrough', ok,  { once: true });
-        a.addEventListener('error',          bad, { once: true });
-        a.src = url;
-        a.load();
-        setTimeout(bad, 1200);  // give up after 1.2s — local files load almost instantly
-      }catch(e){ resolve(false); }
-    });
+        const el = new Audio();
+        el.preload = 'auto';           // start downloading immediately
+        el.src = urlFor(i);
+        elements[i] = el;
+      }catch(e){ failed[i] = true; return null; }
+    }
+    return elements[i];
   }
+
+  // Pre-warm current + next two slides so navigation feels instant.
+  function preloadAround(i){
+    for(let n = i; n <= i + 2 && n < TOTAL; n++){
+      if(n >= 0) getOrCreate(n);
+    }
+  }
+
   function exists(i){
-    if(typeof checked[i] === 'string') return Promise.resolve(true);
-    if(checked[i] === false)            return Promise.resolve(false);
-    const tries = pathCandidates(i);
-    return tries.reduce((p, url) => p.then(found => {
-      if(found) return found;
-      return probeOne(url).then(ok => {
-        if(ok){ checked[i] = url; return true; }
-        return false;
-      });
-    }), Promise.resolve(false))
-    .then(found => { if(!found) checked[i] = false; return found; });
+    // Trust the naming convention. If a file truly is missing, the
+    // <audio> 'error' event will mark it as failed and the caller's
+    // onError hook fires — same outward behaviour as the old probe,
+    // just without the multi-second wait.
+    return Promise.resolve(!failed[i]);
   }
+
+  function detachHandlers(){
+    if(currentEl && currentHandlers){
+      currentEl.removeEventListener('ended',      currentHandlers.onEnded);
+      currentEl.removeEventListener('timeupdate', currentHandlers.onProgress);
+      currentEl.removeEventListener('error',      currentHandlers.onError);
+    }
+    currentHandlers = null;
+  }
+
   function stop(){
-    if(currentEl){ try{ currentEl.pause(); currentEl.currentTime = 0; }catch(e){} currentEl = null; }
+    if(currentEl){
+      try{ currentEl.pause(); currentEl.currentTime = 0; }catch(e){}
+      detachHandlers();
+      currentEl = null;
+    }
   }
+
   function play(i, hooks){
     hooks = hooks || {};
     stop();
-    const url = pathFor(i);
-    // Always create a fresh Audio element bound to the resolved URL —
-    // avoids the bug where a stale element cached the wrong path.
-    const el = new Audio(url);
-    el.preload = 'auto';
-    elements[i] = el;
+    const el = getOrCreate(i);
+    if(!el){
+      const err = new Error('Voice file not available: ' + urlFor(i));
+      if(hooks.onError) hooks.onError(err);
+      return Promise.reject(err);
+    }
+    try{ el.currentTime = 0; }catch(e){}
     currentEl = el;
-    el.onended = ()=>{ if(currentEl === el) currentEl = null; if(hooks.onEnd) hooks.onEnd(); };
-    el.ontimeupdate = ()=>{
-      if(el.duration && hooks.onProgress) hooks.onProgress(el.currentTime / el.duration);
+
+    const handlers = {
+      onEnded: ()=>{
+        if(currentEl === el){ detachHandlers(); currentEl = null; }
+        if(hooks.onEnd) hooks.onEnd();
+      },
+      onProgress: ()=>{
+        if(el.duration && hooks.onProgress) hooks.onProgress(el.currentTime / el.duration);
+      },
+      onError: ()=>{
+        failed[i] = true;
+        delete elements[i];
+        detachHandlers();
+        if(currentEl === el) currentEl = null;
+        if(hooks.onError) hooks.onError(new Error('MP3 failed: ' + urlFor(i)));
+      },
     };
-    el.onerror = ()=>{ checked[i] = false; if(hooks.onError) hooks.onError(new Error('Local MP3 failed to play: ' + url)); };
-    return el.play().then(()=>el).catch(err=>{
+    currentHandlers = handlers;
+    el.addEventListener('ended',      handlers.onEnded);
+    el.addEventListener('timeupdate', handlers.onProgress);
+    el.addEventListener('error',      handlers.onError);
+
+    const promise = el.play();
+    // Preload neighbours regardless of whether play() resolved yet —
+    // the browser starts downloading the moment the Audio is created.
+    preloadAround(i);
+    return promise.then(()=>el).catch(err=>{
       if(hooks.onError) hooks.onError(err);
       throw err;
     });
   }
+
   function pause(){ if(currentEl){ try{ currentEl.pause(); }catch(e){} } }
   function resume(){ if(currentEl){ try{ currentEl.play(); }catch(e){} } }
-  function isSpeaking(){ return !!(currentEl && !currentEl.paused); }
+  function isSpeaking(){ return !!(currentEl && !currentEl.paused && !currentEl.ended); }
   function isPaused(){ return !!(currentEl && currentEl.paused); }
 
-  return { exists, play, stop, pause, resume, isSpeaking, isPaused };
+  // Kick off background download of the first few slides ASAP.
+  try{ preloadAround(0); }catch(e){}
+
+  return { exists, play, stop, pause, resume, isSpeaking, isPaused, preloadAround };
 })();
 
 function speakSlide(i){
@@ -6633,19 +6667,35 @@ function speakSlide(i){
   // ===== Local MP3 path (preferred) =====
   setVoIndLabel('Loading · Voice ' + String(i+1).padStart(2,'0'));
   document.body.classList.add('vo-loading');
-  LOCAL_AUDIO.exists(i).then(has=>{
-    if(!has){ return tryElevenOrFallback(i, text, titleEl); }
-    LOCAL_AUDIO.play(i, {
-      onProgress(pct){ if(titleEl) titleEl.style.setProperty('--vo', (pct*100)+'%'); },
-      onEnd(){ if(titleEl) titleEl.style.setProperty('--vo','100%'); setVoUi('idle'); document.body.classList.remove('vo-narrating','vo-loading'); },
-      onError(){ tryElevenOrFallback(i, text, titleEl); },
-    }).then(()=>{
-      hideVoError();
-      setVoIndLabel('Narrating · Local Voice');
-      document.body.classList.remove('vo-loading');
-      document.body.classList.add('vo-narrating');
-    }).catch(()=>{ tryElevenOrFallback(i, text, titleEl); });
-  });
+  LOCAL_AUDIO.play(i, {
+    onProgress(pct){ if(titleEl) titleEl.style.setProperty('--vo', (pct*100)+'%'); },
+    onEnd(){
+      if(titleEl) titleEl.style.setProperty('--vo','100%');
+      setVoUi('idle');
+      document.body.classList.remove('vo-narrating','vo-loading');
+      // If "Begin the Journey" was pressed while we were on the cover,
+      // advance to slide 2 the moment the cover narration finishes.
+      if(_navigateAfterCoverEnds && i === 0){
+        _navigateAfterCoverEnds = false;
+        goTo(1);
+      }
+    },
+    onError(){
+      // If the cover narration can't play and the user is waiting to
+      // begin the journey, don't strand them on the cover — navigate.
+      if(_navigateAfterCoverEnds && i === 0){
+        _navigateAfterCoverEnds = false;
+        goTo(1);
+        return;
+      }
+      tryElevenOrFallback(i, text, titleEl);
+    },
+  }).then(()=>{
+    hideVoError();
+    setVoIndLabel('Narrating · Local Voice');
+    document.body.classList.remove('vo-loading');
+    document.body.classList.add('vo-narrating');
+  }).catch(()=>{ /* handled in onError */ });
 
   // PRE-FETCH next two slides' audio in the background so navigation
   // feels instant (cache hit = play immediately, no API call)
