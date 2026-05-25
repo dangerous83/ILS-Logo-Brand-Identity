@@ -5633,10 +5633,19 @@ function goTo(i){
   slides[i].scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-/* IntersectionObserver to mark active slide */
+/* IntersectionObserver to mark active slide.
+   NOTE: slides taller than the viewport (e.g. slide 6 on mobile, where
+   9 value cells stack into one column) can never reach intersectionRatio
+   > 0.5 — their max possible ratio is viewport_height / slide_height,
+   often around 0.3 on a phone. So we also accept a slide as active when
+   it covers most of the viewport. */
 const io = new IntersectionObserver(entries=>{
   entries.forEach(e=>{
-    if(e.intersectionRatio > 0.5){
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const rect = e.target.getBoundingClientRect();
+    const visible = Math.max(0, Math.min(vh, rect.bottom) - Math.max(0, rect.top));
+    const viewportCoverage = vh ? (visible / vh) : 0;
+    if(e.intersectionRatio > 0.5 || viewportCoverage > 0.6){
       const idx = slides.indexOf(e.target);
       // gate: if user wheel-scrolled past 10 while locked, snap back.
       if(idx > S10_INDEX && currentIndex === S10_INDEX && !s10AllReady()){
@@ -5648,7 +5657,7 @@ const io = new IntersectionObserver(entries=>{
       if(idx !== -1 && idx !== currentIndex) setActive(idx);
     }
   });
-}, {threshold:[0,.25,.5,.75,1]});
+}, {threshold:[0,.1,.2,.25,.3,.4,.5,.6,.75,1]});
 slides.forEach(s=>io.observe(s));
 
 /* wheel + touch lock — prevents the snap engine from moving
@@ -7444,28 +7453,35 @@ function isNarratingNow(){
    attempt. So audio starts the instant the user interacts at all.
    =============================================================== */
 let _kickArmed = false;
+const _kickEventList = [
+  'pointerdown','pointerup','mousedown','mouseup','click',
+  'keydown','keyup',
+  'touchstart','touchend',
+  'wheel','scroll',
+  'focus','focusin'
+];
+function _removeKick(){
+  if(!_kickArmed) return;
+  _kickEventList.forEach(ev => window.removeEventListener(ev, _kickNarration, true));
+  _kickArmed = false;
+}
 function _kickNarration(){
-  if(voMuted) return;
-  if(isNarratingNow()) return;
+  if(voMuted){ _removeKick(); return; }
+  if(isNarratingNow()){ _removeKick(); return; }
   try{ SFX.unlock(); }catch(e){}
   setVoUi('playing');
   speakSlide(currentIndex);
+  // The kick handler exists only to satisfy the browser's "first user
+  // gesture" autoplay gate. Once we've fired it, slide navigation in
+  // setActive() takes over — keeping the listeners attached caused
+  // every subsequent tap on the page to restart the current slide's
+  // voice-over. Remove them now that audio is unlocked.
+  setTimeout(()=>{ if(isNarratingNow()) _removeKick(); }, 300);
 }
 function armNarrationKick(){
   if(_kickArmed) return;
   _kickArmed = true;
-  const events = [
-    'pointerdown','pointerup','mousedown','mouseup','click',
-    'keydown','keyup',
-    'touchstart','touchend',
-    'wheel','scroll',
-    'focus','focusin'
-  ];
-  // Each handler tries to start; if successful, isNarratingNow()
-  // returns true and subsequent fires are no-ops. We don't remove
-  // the listeners — they stay armed for the lifetime of the page,
-  // so a stop+restart from the user can always re-kick.
-  events.forEach(ev => {
+  _kickEventList.forEach(ev => {
     window.addEventListener(ev, _kickNarration, true);
   });
 }
